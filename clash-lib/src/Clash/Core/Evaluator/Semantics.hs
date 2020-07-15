@@ -25,6 +25,7 @@ import BasicTypes (InlineSpec(..))
 import Clash.Core.DataCon
 import Clash.Core.Evaluator.Models
 import Clash.Core.Literal
+import Clash.Core.Subst
 import Clash.Core.Term
 import Clash.Core.Termination
 import Clash.Core.TermInfo
@@ -165,17 +166,16 @@ evaluateVarWith eval i
  where
   goLocal :: Eval Value
   goLocal = getLocal i >>= \case
-    Just x  -> forceLocal x
+    Just x  -> either (withoutLocal i . eval) pure x
     Nothing -> pure (VNeu (NeVar i))
-   where
-    forceLocal = either (withoutLocal i . eval) pure
 
   goGlobal :: Eval Value
   goGlobal = do
+    gInScope <- getInScope
     gRecInfo <- getRecInfo
     gFuel <- getFuel
 
-    getGlobal i >>= \case
+    preserveContext $ getGlobal i >>= \case
       Just b
         -- The binding can't be inlined.
         |  bindingSpec b == NoInline
@@ -186,21 +186,22 @@ evaluateVarWith eval i
         -> if gFuel == 0
              then pure (VNeu (NeVar i))
              else do
-               v <- forceGlobal (bindingTerm b)
+               putContext i
                putFuel (gFuel - 1)
+
+               v <- either (eval . deShadowTerm gInScope) pure (bindingTerm b)
                updateGlobal i v
                pure v
 
         -- The binding can be inlined without using fuel.
         |  otherwise
-        -> do v <- forceGlobal (bindingTerm b)
+        -> do putContext i
+              v <- either (eval . deShadowTerm gInScope) pure (bindingTerm b)
               updateGlobal i v
               pure v
 
       Nothing
         -> pure (VNeu (NeVar i))
-   where
-    forceGlobal = either eval pure
 
 -- | Default implementation for evaluating a literal.
 -- This simply wraps the literal up into a Value.

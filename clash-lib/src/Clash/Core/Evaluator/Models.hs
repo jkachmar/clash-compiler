@@ -68,7 +68,7 @@ newtype Eval a = Eval { unEval :: RWS LocalEnv () GlobalEnv a }
 --
 runEval :: GlobalEnv -> Eval a -> (a, GlobalEnv)
 runEval genv x =
-  let lenv = LocalEnv mempty mempty
+  let lenv = LocalEnv (genvContext genv) mempty mempty (genvFuel genv)
       (x', genv', _) = RWS.runRWS (unEval x) lenv genv
    in (x', genv')
 
@@ -96,16 +96,30 @@ type TermOrValue = Either Term Value
 -- | Local Environment
 --
 data LocalEnv = LocalEnv
-  { lenvTypes  :: Map TyVar Type
+  { lenvContext :: Id
+    -- ^ Local context. This is the context in the global environment when
+    -- evaluation reached a head (Lam / TyLam / Data / Prim) so quote can
+    -- "remember" what was being evaluated.
+  , lenvTypes  :: Map TyVar Type
     -- ^ Local type environment. These are types that are introduced while
     -- evaluating the current term (e.g. by type applications).
   , lenvTerms  :: Map Id TermOrValue
     -- ^ Local term environment. These are the terms that are introduced while
     -- evaluating the current term (e.g. by applications).
+  , lenvFuel   :: Word
+    -- ^ Local fuel. This is the amount of fuel left in the global environment
+    -- when evaluation reached a head (Lam / TyLam / Data / Prim) so quote can
+    -- "remember" how much fuel there was at that point in evaluation.
   } deriving (Show)
 
 getLocalEnv :: Eval LocalEnv
-getLocalEnv = RWS.ask
+getLocalEnv = do
+  lenv <- RWS.ask
+  context <- RWS.gets genvContext
+  fuel <- getFuel
+
+  -- Ensure the context and fuel are saved in the local environment.
+  pure (lenv { lenvContext = context, lenvFuel = fuel })
 
 withLocalEnv :: LocalEnv -> Eval a -> Eval a
 withLocalEnv env = RWS.local (const env)
@@ -119,9 +133,14 @@ getLocal i = Map.lookup i <$> RWS.asks lenvTerms
 -- action. The new binding only exists when evaluating the given action.
 --
 withLocal :: (Id, TermOrValue) -> Eval a -> Eval a
-withLocal (i, tm) = RWS.local addBinding
+withLocal (i, tm) act = do
+  iss <- RWS.gets genvInScope
+  env <- RWS.get
+
+  RWS.put (env { genvInScope = extendInScopeSet iss i })
+  RWS.local addBinding act
  where
-  addBinding env@(LocalEnv _ tms) =
+  addBinding env@(LocalEnv _ _ tms _) =
     env { lenvTerms = Map.insert i tm tms }
 
 -- | Remove a local term binding from the environment, then evaluate the given
@@ -130,7 +149,7 @@ withLocal (i, tm) = RWS.local addBinding
 withoutLocal :: Id -> Eval a -> Eval a
 withoutLocal i = RWS.local deleteBinding
  where
-  deleteBinding env@(LocalEnv _ tms) =
+  deleteBinding env@(LocalEnv _ _ tms _) =
     env { lenvTerms = Map.delete i tms }
 
 withLocals :: [(Id, TermOrValue)] -> Eval a -> Eval a
@@ -145,9 +164,14 @@ getType i = Map.lookup i <$> RWS.asks lenvTypes
 -- action. The new binding only exists when evaluating the given action.
 --
 withType :: (TyVar, Type) -> Eval a -> Eval a
-withType (i, ty) = RWS.local addBinding
+withType (i, ty) act = do
+  iss <- RWS.gets genvInScope
+  env <- RWS.get
+
+  RWS.put (env { genvInScope = extendInScopeSet iss i })
+  RWS.local addBinding act
  where
-  addBinding env@(LocalEnv tys _) =
+  addBinding env@(LocalEnv _ tys _ _) =
     env { lenvTypes = Map.insert i ty tys }
 
 withTypes :: [(TyVar, Type)] -> Eval a -> Eval a
@@ -156,7 +180,14 @@ withTypes bs x = foldr withType x bs
 -- | Global Environment
 --
 data GlobalEnv = GlobalEnv
-  { genvGlobals :: VarEnv (Binding TermOrValue)
+  { genvContext :: Id
+    -- ^ The identifier of the binding currently under evaluation. This is
+    -- used to prevent inlining self-recursive calls (which is never
+    -- productive) without preventing inlining auxiliary recursive calls.
+    --
+    -- TODO When Clash supports mutually recursive bindings, this will need
+    -- to be changed to a VarSet or something similar.
+  , genvGlobals :: VarEnv (Binding TermOrValue)
     -- ^ Global term environment. These are functions in global scope which
     -- are evaluated on lookup, and updated after evaluation.
   , genvRecInfo :: RecInfo
@@ -184,7 +215,8 @@ data GlobalEnv = GlobalEnv
 type GlobalIO = (IntMap Value, Int)
 
 mkGlobalEnv
-  :: BindingMap
+  :: Id
+  -> BindingMap
   -> RecInfo
   -> Word
   -> GlobalIO
@@ -192,11 +224,33 @@ mkGlobalEnv
   -> InScopeSet
   -> Supply
   -> GlobalEnv
-mkGlobalEnv bs =
-  GlobalEnv (fmap Left <$> bs)
+mkGlobalEnv i bs =
+  GlobalEnv i (fmap Left <$> bs)
 
+putContext :: Id -> Eval ()
+putContext i = do
+  env <- RWS.get
+  RWS.put (env { genvContext = i })
+
+preserveContext :: Eval a -> Eval a
+preserveContext x = do
+  context <- RWS.gets genvContext
+  res <- x
+  env <- RWS.get
+
+  RWS.put (env { genvContext = context })
+  pure res
+
+-- | Get a global from the environment. This will return Nothing if the global
+-- refers to the current context. See genvContext in GlobalEnv.
+--
 getGlobal :: Id -> Eval (Maybe (Binding TermOrValue))
-getGlobal i = lookupVarEnv i <$> RWS.gets genvGlobals
+getGlobal i = do
+  context <- RWS.gets genvContext
+
+  if context == i
+    then pure Nothing
+    else lookupVarEnv i <$> RWS.gets genvGlobals
 
 -- | Update a global binding, replacing it with a WHNF representation.
 --
@@ -217,7 +271,7 @@ getRecInfo :: Eval RecInfo
 getRecInfo = RWS.gets genvRecInfo
 
 getFuel :: Eval Word
-getFuel = RWS.gets genvFuel
+getFuel = min <$> RWS.asks lenvFuel <*> RWS.gets genvFuel
 
 putFuel :: Word -> Eval ()
 putFuel x = RWS.modify' (\env -> env { genvFuel = x })
@@ -228,7 +282,7 @@ putFuel x = RWS.modify' (\env -> env { genvFuel = x })
 --
 preserveFuel :: Eval a -> Eval a
 preserveFuel x = do
-  fuel <- RWS.gets genvFuel
+  fuel <- getFuel
   res  <- x
   env  <- RWS.get
 
@@ -237,6 +291,9 @@ preserveFuel x = do
 
 getTyConMap :: Eval TyConMap
 getTyConMap = RWS.gets genvTyCons
+
+getInScope :: Eval InScopeSet
+getInScope = RWS.gets genvInScope
 
 mkUniqueVar
   :: ((Supply, InScopeSet)

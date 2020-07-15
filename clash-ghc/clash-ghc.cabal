@@ -205,6 +205,15 @@ library
                       Clash.GHC.NetlistTypes
 
                       Clash.GHC.PartialEval
+                      Clash.GHC.PartialEval.Char
+                      Clash.GHC.PartialEval.Double
+                      Clash.GHC.PartialEval.Float
+                      Clash.GHC.PartialEval.Int
+                      Clash.GHC.PartialEval.Integer
+                      Clash.GHC.PartialEval.Internal
+                      Clash.GHC.PartialEval.Narrowing
+                      Clash.GHC.PartialEval.Natural
+                      Clash.GHC.PartialEval.Word
 
                       Clash.GHCi.Common
 

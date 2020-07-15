@@ -17,6 +17,7 @@ module Clash.GHC.PartialEval
 import Data.Bifunctor
 import Data.Bitraversable
 import Data.Either (partitionEithers)
+import qualified Data.HashMap.Strict as HashMap
 import GHC.Integer.GMP.Internals (BigNat(..), Integer(..))
 import Unsafe.Coerce
 
@@ -31,6 +32,16 @@ import Clash.Core.Type
 import Clash.Core.Var
 import Clash.Unique
 
+import Clash.GHC.PartialEval.Char
+import Clash.GHC.PartialEval.Double
+import Clash.GHC.PartialEval.Float
+import Clash.GHC.PartialEval.Int
+import Clash.GHC.PartialEval.Integer
+import Clash.GHC.PartialEval.Internal
+import Clash.GHC.PartialEval.Narrowing
+import Clash.GHC.PartialEval.Natural
+import Clash.GHC.PartialEval.Word
+
 -- | An evaluator for partial evaluation that uses GHC specific details. This
 -- allows the evaluator to be implemented with an understanding of built-in
 -- GHC types and primitives which can appear in Clash core when using GHC as a
@@ -39,17 +50,34 @@ import Clash.Unique
 ghcEvaluator :: Evaluator
 ghcEvaluator = evaluatorWith ghcMatchLiteral ghcMatchData ghcEvaluatePrim
 
--- TODO Implement evaluation for primitives and call here.
---
+-- | Evaluate a primitive using the specified primitive implementations.
 -- If a primitive can't be reduced, we do the next best thing and force all
 -- it's arguments to WHNF. This is done to simplify the definition of the
 -- NePrim constructor in Neutral.
 --
 ghcEvaluatePrim :: PrimInfo -> [Either Term Type] -> Eval Value
 ghcEvaluatePrim p args =
-  VNeu . NePrim p <$> forceArgs args
+  case HashMap.lookup (primName p) primImpls of
+    Just f  -> runPrimEval (f ghcEvaluator p args) neuPrim
+--    (error $ "Failed to evaluate prim: " <> show (primName p) <> " with args " <> show args)
+
+    -- TODO This should ideally warn that a primitive has no implementation.
+    Nothing -> neuPrim
+-- error $ "ghcEvaluatePrim: No implementation for " <> show (primName p)
  where
-  forceArgs = traverse (bitraverse (evaluateWhnf ghcEvaluator) pure)
+  neuPrim = fmap (VNeu . NePrim p) (toWhnf args)
+  toWhnf  = traverse (bitraverse (evaluateWhnf ghcEvaluator) pure)
+
+  primImpls = HashMap.unions
+    [ charPrims
+    , doublePrims
+    , floatPrims
+    , intPrims
+    , integerPrims
+    , narrowingPrims
+    , naturalPrims
+    , wordPrims
+    ]
 
 -- | Attempt to match a literal against a pattern. If the pattern matches
 -- the literal, any identifiers bound in the pattern are added to the
